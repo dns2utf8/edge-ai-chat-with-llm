@@ -1,9 +1,9 @@
+use log::info;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::error::Error;
 use std::io::{self, Write};
-use log::info;
 
 // --- 1. COMMON TYPES (Provided) ---
 // These are the data structures for interacting with the LLM API.
@@ -97,7 +97,7 @@ mod rag {
     #[derive(Deserialize)]
     struct EmbeddingResponse {
         #[serde(rename = "index")]
-        _index: i32,
+        index: i32,
         embedding: Vec<Vec<f32>>,
     }
 
@@ -116,6 +116,7 @@ mod rag {
             }
         }
 
+        /// query the ollama server for the embedding
         async fn get_embeddings(&self, text: &str) -> Result<Vec<f32>, Box<dyn Error>> {
             let payload = json!({ "content": text });
             let response: Vec<EmbeddingResponse> = self
@@ -126,7 +127,8 @@ mod rag {
                 .await?
                 .json()
                 .await?;
-            Ok(response.first()
+            Ok(response
+                .first()
                 .ok_or("No embeddings found")?
                 .embedding
                 .first()
@@ -137,36 +139,71 @@ mod rag {
         pub async fn add_document(&mut self, doc: &str) -> Result<(), Box<dyn Error>> {
             info!("Embedding document: \"{}\"", doc);
             // TODO 2.0: Embed the document and add it to the toy vector database - self.documents in this case.
-            !unimplemented!()
+
+            let embedding = self.get_embeddings(doc).await?;
+
+            self.documents.push((doc.to_string(), embedding));
+
+            Ok(())
         }
 
-        pub async fn find_most_similar(&self, query: &str) -> Result<Option<(String, f32)>, Box<dyn Error>> {
+        pub async fn find_most_similar(
+            &self,
+            query: &str,
+        ) -> Result<Option<(String, f32)>, Box<dyn Error>> {
             const SIMILARITY_THRESHOLD: f32 = 0.1;
 
             // TODO 2.2: Get the embedding for the user's query, using self.get_embeddings.
+            let embedding = self.get_embeddings(query).await?;
 
             // TODO 2.4: Find the document most similar to the user's query.
             // Iterate through `self.documents`. For each `(doc, doc_embedding)`, calculate the
             // `cosine_similarity` with the `query_embedding`. If the similarity is the best
             // so far, update `best_match`.
+            let mut best_match: Option<(&String, f32)> = None;
+            for (doc, doc_embedding) in &self.documents {
+                let similarity = cosine_similarity(&embedding, doc_embedding);
+                if similarity > SIMILARITY_THRESHOLD {
+                    if let Some((_, best_score)) = &best_match {
+                        if similarity > *best_score {
+                            best_match = Some((doc, similarity));
+                        }
+                    } else {
+                        best_match = Some((doc, similarity));
+                    }
+                }
+            }
 
             // TODO 2.5: Check if the similarity for the best match is above the SIMILARITY_THRESHOLD.
             // You can play around with the threshold value to see how it affects the results.
 
-            unimplemented!()
+            Ok(best_match.map(|(doc, score)| (doc.clone(), score)))
         }
     }
 
     /// Calculates the cosine similarity between two vectors.
     fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+        debug_assert!(a.len() == b.len(), "Vectors must be of the same length");
         // TODO 2.3: Calculate the cosine similarity of vectors `a` and `b`.
         // The formula is: (A · B) / (||A|| * ||B||)
         // 1.  Dot Product (A · B) - this is the sum of the products of corresponding elements.
+        let dot_product = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum::<f32>();
+
         //     Formula: Σ(a_i * b_i)
         // 2.  L2 Norm - this is the square root of the sum of the squares of the elements.
+        fn norm(v: &[f32]) -> f32 {
+            v.iter().map(|x| x * x).sum::<f32>().sqrt()
+        }
+        let norm_a = norm(a);
+        let norm_b = norm(b);
+
         //     Formula: sqrt(Σ(a_i^2))
         // 3.  If either norm is 0.0, return 0.0 to prevent division by zero.
-        unimplemented!()
+        if norm_a == 0.0 || norm_b == 0.0 {
+            return 0.0;
+        }
+        // 4.  Finally, calculate the cosine similarity.
+        dot_product / (norm_a * norm_b)
     }
 }
 
@@ -180,9 +217,49 @@ mod tools {
     pub fn get_tools_definition() -> Vec<Tool> {
         // TODO 4: Define a tool named `calculate`, that uses the `calculate` function.
         // Hint: Parameters are defined by a JSON schema, you can use its features, such as enums, descriptions and nested objects.
-        vec![]
+        vec![
+            Tool {
+                r#type: "function".to_string(),
+                function: Function {
+                    name: "calculate".to_string(),
+                    description: "Performs basic arithmetic operations between two numbers."
+                        .to_string(),
+                    parameters: json!({
+                        "type": "object",
+                        "properties": {
+                            "num1": {
+                                "type": "integer",
+                                "description": "The first number."
+                            },
+                            "num2": {
+                                "type": "integer",
+                                "description": "The second number."
+                            },
+                            "op": {
+                                "type": "string",
+                                "enum": ["add", "subtract", "multiply", "divide"],
+                                "description": "The operation to perform: add, subtract, multiply, or divide."
+                            }
+                        },
+                        "required": ["num1", "num2", "op"]
+                    }),
+                },
+            },
+            Tool {
+                r#type: "function".to_string(),
+                function: Function {
+                    name: "get_current_time".to_string(),
+                    description: "Returns the current system time.".to_string(),
+                    parameters: json!({
+                        "type": "object",
+                        "properties": {},
+                        "required": []
+                    }),
+                },
+            },
+        ]
     }
-    
+
     async fn calculate(num1: i64, num2: i64, op: &str) -> Result<i64, Box<dyn Error>> {
         match op {
             "add" => Ok(num1 + num2),
@@ -194,7 +271,7 @@ mod tools {
                 } else {
                     Ok(num1 / num2)
                 }
-            },
+            }
             _ => Err(format!("Unknown operation: {}", op).into()),
         }
     }
@@ -209,8 +286,12 @@ mod tools {
             let op = args["op"].as_str().ok_or("Missing op for calculate")?;
             let result = calculate(num1, num2, op).await?;
             Ok(format!("<tool_result>{}</tool_result>", result))
-        }
-        else {
+        } else if tool_call.function.name == "get_current_time" {
+            info!("> Tool call: get_current_time");
+            let now = chrono::Local::now();
+            let time_str = now.format("%Y-%m-%d %H:%M:%S").to_string();
+            Ok(format!("<tool_result>{}</tool_result>", time_str))
+        } else {
             Err(format!("Unknown tool: {}", tool_call.function.name).into())
         }
     }
@@ -230,7 +311,7 @@ async fn call_llm_api(
     } else {
         None
     };
-    
+
     // TODO 1: Implement the API call to the LLM server.
     // This function will send the conversation history and available tools to the LLM.
     //
@@ -239,26 +320,56 @@ async fn call_llm_api(
     //     - `model`: Use the `model` parameter.
     //     - `messages`: Use the `messages` parameter.
     //     - `tools`: If `use_tools` is true, call `tools::get_tools_definition()`. Otherwise, use an empty vector.
+    let chat_req = ChatRequest {
+        model: model.to_owned(),
+        messages,
+        tools,
+        response_format,
+    };
+
     // 2.  Use the `reqwest::Client` to make a POST request.
     //     - The URL should be `"{llm_url}/v1/chat/completions"`.
     //     - Send the `ChatRequest` as JSON using the `.json()` method.
     //     - `await` the response.
+
+    let req = reqwest::Client::new()
+        .post(format!("{llm_url}/v1/chat/completions"))
+        .json(&chat_req)
+        .send()
+        .await?;
+
+    let resp_json: Value = req.json().await?;
+    // println!("LLM response: {}", resp_json);
+
+    let choices = serde_json::from_value(resp_json["choices"].clone())?;
+
     // 3.  Return the `ChatCompletion`.
-    
-    unimplemented!()
+    Ok(ChatCompletion { choices })
 }
 
 // --- 5. AGENT LOGIC ---
 
 /// Handles a simple response from the LLM.
-async fn handle_simple_response(client: &Client, llm_url: &str, model: &str, messages: &mut Vec<Message>, user_input: &str) -> Result<(), Box<dyn Error>> {
+async fn handle_simple_response(
+    client: &Client,
+    llm_url: &str,
+    model: &str,
+    messages: &mut Vec<Message>,
+    user_input: &str,
+) -> Result<(), Box<dyn Error>> {
     info!("> Simple Mode: Generating a response...");
-    messages.push(Message { role: "user".to_string(), content: user_input.to_string() });
+    messages.push(Message {
+        role: "user".to_string(),
+        content: user_input.to_string(),
+    });
 
     let response = call_llm_api(&client, llm_url, model, messages.clone(), false, None).await?;
     if let Some(content) = &response.choices[0].message.content {
         println!("ASSISTANT: {}", content);
-        messages.push(Message { role: "assistant".to_string(), content: content.clone() });
+        messages.push(Message {
+            role: "assistant".to_string(),
+            content: content.clone(),
+        });
     } else {
         println!("ASSISTANT: <no response>");
     }
@@ -266,12 +377,22 @@ async fn handle_simple_response(client: &Client, llm_url: &str, model: &str, mes
 }
 
 /// Handles a query using the RAG pipeline.
-async fn handle_rag_response(client: &Client, llm_url: &str, model: &str, db: &rag::VectorDB, messages: &mut Vec<Message>, user_input: &str) -> Result<(), Box<dyn Error>> {
+async fn handle_rag_response(
+    client: &Client,
+    llm_url: &str,
+    model: &str,
+    db: &rag::VectorDB,
+    messages: &mut Vec<Message>,
+    user_input: &str,
+) -> Result<(), Box<dyn Error>> {
     info!("> RAG Mode: Searching internal documents...");
-    
+
     let context = db.find_most_similar(user_input).await?;
     let augmented_prompt = if let Some((ctx, score)) = context {
-        info!("> Found relevant context: \"{}\", with score: {}", ctx, score);
+        info!(
+            "> Found relevant context: \"{}\", with score: {}",
+            ctx, score
+        );
         format!(
             "Answer the user's query based *only* on the following context.\n\nContext: \"{}\"\n\nUser query: {}",
             ctx, user_input
@@ -282,13 +403,22 @@ async fn handle_rag_response(client: &Client, llm_url: &str, model: &str, db: &r
     };
 
     let mut rag_messages = messages.clone();
-    rag_messages.push(Message { role: "user".to_string(), content: augmented_prompt });
+    rag_messages.push(Message {
+        role: "user".to_string(),
+        content: augmented_prompt,
+    });
 
     let response = call_llm_api(client, llm_url, model, rag_messages, false, None).await?;
     if let Some(content) = &response.choices[0].message.content {
         println!("ASSISTANT: {}", content);
-        messages.push(Message { role: "user".to_string(), content: user_input.to_string() });
-        messages.push(Message { role: "assistant".to_string(), content: content.clone() });
+        messages.push(Message {
+            role: "user".to_string(),
+            content: user_input.to_string(),
+        });
+        messages.push(Message {
+            role: "assistant".to_string(),
+            content: content.clone(),
+        });
     } else {
         println!("ASSISTANT: <no response>");
     }
@@ -296,7 +426,13 @@ async fn handle_rag_response(client: &Client, llm_url: &str, model: &str, db: &r
 }
 
 /// Handles a query that may require using tools.
-async fn handle_tool_response(client: &Client, llm_url: &str, model: &str, messages: &mut Vec<Message>, user_input: &str) -> Result<(), Box<dyn Error>> {
+async fn handle_tool_response(
+    client: &Client,
+    llm_url: &str,
+    model: &str,
+    messages: &mut Vec<Message>,
+    user_input: &str,
+) -> Result<(), Box<dyn Error>> {
     let mut tool_messages = messages.clone();
 
     let tool_prompt = format!(
@@ -304,7 +440,10 @@ async fn handle_tool_response(client: &Client, llm_url: &str, model: &str, messa
         user_input
     );
 
-    tool_messages.push(Message { role: "user".to_string(), content: tool_prompt.to_string() });
+    tool_messages.push(Message {
+        role: "user".to_string(),
+        content: tool_prompt.to_string(),
+    });
 
     // First, call the LLM to see if it wants to use a tool.
     let response = call_llm_api(client, llm_url, model, tool_messages.clone(), true, None).await?;
@@ -312,34 +451,59 @@ async fn handle_tool_response(client: &Client, llm_url: &str, model: &str, messa
 
     if let Some(tool_calls) = &assistant_message.tool_calls {
         // The LLM wants to use a tool.
-        tool_messages.push(Message { role: "assistant".to_string(), content: serde_json::to_string(&tool_calls)? });
+        tool_messages.push(Message {
+            role: "assistant".to_string(),
+            content: serde_json::to_string(&tool_calls)?,
+        });
 
         for tool_call in tool_calls {
             let tool_result = tools::execute_tool_call(tool_call).await?;
             info!("> Tool result: {}", tool_result);
-            tool_messages.push(Message { role: "user".to_string(), content: tool_result });
+            tool_messages.push(Message {
+                role: "user".to_string(),
+                content: tool_result,
+            });
         }
 
         // Now, call the LLM again with the tool results to get a final answer.
-        let final_response = call_llm_api(client, llm_url, model, tool_messages, false, None).await?;
+        let final_response =
+            call_llm_api(client, llm_url, model, tool_messages, false, None).await?;
         if let Some(content) = &final_response.choices[0].message.content {
             println!("ASSISTANT: {}", content);
-            messages.push(Message { role: "user".to_string(), content: user_input.to_string() });
-            messages.push(Message { role: "assistant".to_string(), content: content.clone() });
+            messages.push(Message {
+                role: "user".to_string(),
+                content: user_input.to_string(),
+            });
+            messages.push(Message {
+                role: "assistant".to_string(),
+                content: content.clone(),
+            });
         } else {
             println!("ASSISTANT: <no response after tool use>");
         }
     } else if let Some(content) = &assistant_message.content {
         // The LLM answered directly without using a tool.
         println!("ASSISTANT: {}", content);
-        messages.push(Message { role: "user".to_string(), content: user_input.to_string() });
-        messages.push(Message { role: "assistant".to_string(), content: content.clone() });
+        messages.push(Message {
+            role: "user".to_string(),
+            content: user_input.to_string(),
+        });
+        messages.push(Message {
+            role: "assistant".to_string(),
+            content: content.clone(),
+        });
     }
     Ok(())
 }
 
 /// Handles a query by extracting structured data.
-async fn handle_structured_output_response(client: &Client, llm_url: &str, model: &str, messages: &mut Vec<Message>, user_input: &str) -> Result<(), Box<dyn Error>> {
+async fn handle_structured_output_response(
+    client: &Client,
+    llm_url: &str,
+    model: &str,
+    messages: &mut Vec<Message>,
+    user_input: &str,
+) -> Result<(), Box<dyn Error>> {
     info!("> Structured Output Mode: Extracting information...");
 
     let structured_prompt = format!(
@@ -347,18 +511,52 @@ async fn handle_structured_output_response(client: &Client, llm_url: &str, model
         user_input
     );
 
-    let structured_messages = vec![Message { role: "user".to_string(), content: structured_prompt }];
+    let structured_messages = vec![Message {
+        role: "user".to_string(),
+        content: structured_prompt,
+    }];
 
     // TODO 3.1: Define the response_format
-    let response_format: Option<ResponseFormat> = None;
+    let response_format: Option<ResponseFormat> = Some(ResponseFormat {
+        r#type: "json_schema".to_string(),
+        json_schema: JsonSchemaWrapper {
+            name: "UserInfo".to_string(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "The user's full name."
+                    },
+                    "city": {
+                        "type": "string",
+                        "description": "The city where the user lives."
+                    },
+                    "age": {
+                        "type": "integer",
+                        "description": "The user's age."
+                    }
+                },
+                "required": ["name", "city", "age"]
+            }),
+        },
+    });
 
-    let response = call_llm_api(client, llm_url, model, structured_messages, false, response_format).await?;
-
+    let response = call_llm_api(
+        client,
+        llm_url,
+        model,
+        structured_messages,
+        false,
+        response_format,
+    )
+    .await?;
 
     // TODO 3.2: Parse the response as JSON, using the UserInfo struct defined above.
-    unimplemented!()
-}
+    println!("STRUCTURED: {response:?}");
 
+    Ok(())
+}
 
 // --- 6. MAIN LOOP ---
 #[tokio::main]
@@ -374,6 +572,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut db = rag::VectorDB::new(embeddings_url);
 
     // TODO 2.1: Add internal documents that the model could not know. For example:
+    db.add_document(
+        "Alice is a software engineer living in San Francisco. She loves hiking and photography. Alice is the lead engineer for the new 'Orion' feature.",
+    )
+    .await?;
+    db.add_document(
+        "Bob is a data scientist based in New York. He enjoys cooking and playing chess. The secret code to access the project is 'quantum_leap_42'.",
+    )
+    .await?;
+    db.add_document(
+        "Charlie is a teacher from Chicago. He likes reading science fiction and cycling. The project deadline has been moved to next Friday.",
+    )
+    .await?;
 
     // --- Main Loop ---
     println!("\nWelcome! I am a helpful assistant. How can I help you today?");
@@ -391,7 +601,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             break;
         }
 
-        println!("Choose mode: (1) Simple response, (2) RAG, (3) Structured Outputs, (4) Tool Calling");
+        println!(
+            "Choose mode: (1) Simple response, (2) RAG, (3) Structured Outputs, (4) Tool Calling"
+        );
         print!("Mode: ");
         io::stdout().flush()?;
         let mut mode_input = String::new();
@@ -400,8 +612,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
         let result = match mode {
             "1" => handle_simple_response(&client, llm_url, model, &mut messages, user_input).await,
-            "2" => handle_rag_response(&client, llm_url, model, &db, &mut messages, user_input).await,
-            "3" => handle_structured_output_response(&client, llm_url, model, &mut messages, user_input).await,
+            "2" => {
+                handle_rag_response(&client, llm_url, model, &db, &mut messages, user_input).await
+            }
+            "3" => {
+                handle_structured_output_response(
+                    &client,
+                    llm_url,
+                    model,
+                    &mut messages,
+                    user_input,
+                )
+                .await
+            }
             "4" => handle_tool_response(&client, llm_url, model, &mut messages, user_input).await,
             _ => {
                 println!("Invalid mode selected. Please enter '1', '2', '3', or '4'.");
@@ -418,4 +641,3 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     Ok(())
 }
-
